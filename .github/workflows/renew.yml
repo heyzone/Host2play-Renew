@@ -3,7 +3,11 @@ name: Host2Play Auto Renew
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 1,8,15,22 * * *"
+    # 每天 0:00 / 8:00 / 16:00 UTC 左右
+    - cron: "21 7,23 * * *"
+
+permissions:
+  contents: read
 
 jobs:
   renew:
@@ -11,67 +15,87 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      # =========================
+      # 📥 检出代码
+      # =========================
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # 如果是当前仓库，直接用 checkout@v4 即可；
+          # 如果是私有仓库，请确保 PRIVATE_REPO_TOKEN 正确
+          path: scripts
 
-      - uses: actions/setup-node@v4
+      # =========================
+      # ⚡️ 环境准备
+      # =========================
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install system deps (audio + unzip + xvfb)
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb wget unzip curl jq p7zip-full
 
-          # ⭐ Buster audio challenge 必须的依赖
-          sudo apt-get install -y pulseaudio alsa-utils ffmpeg
-
-          pulseaudio --start --exit-idle-time=-1 || true
-
-          pactl load-module module-null-sink sink_name=virtual_speaker || true
-          pactl set-default-sink virtual_speaker || true
-
-          pactl load-module module-virtual-source source_name=virtual_mic || true
-          pactl set-default-source virtual_mic || true
-
-      - name: Install hysteria2 client
+      # =========================
+      # 📡 安装 Hysteria2
+      # =========================
+      - name: Install Hysteria2
         run: |
           curl -L -o hysteria https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64
           chmod +x hysteria
           sudo mv hysteria /usr/local/bin/
+          hysteria version
 
-      - name: Install node deps + playwright chromium
+      # =========================
+      # 📦 Node 依赖 + Playwright
+      # =========================
+      - name: Install Node dependencies
+        working-directory: scripts
         run: |
           npm init -y
           npm install playwright
-          npx playwright install chromium
+          # 安装 chromium 及其系统驱动依赖
+          npx playwright install --with-deps chromium
 
-      - name: Download Buster extension
+      # =========================
+      # 🧩 下载并解压 NopeCHA (核心修改)
+      # =========================
+      - name: Download and Unpack NopeCHA
+        working-directory: scripts
         run: |
-          mkdir -p extensions/buster
-          wget -O extensions/buster/buster.zip \
-            https://github.com/dessant/buster/releases/download/v3.1.0/buster_captcha_solver_for_humans-3.1.0-chrome.zip
+          mkdir -p extensions/nopecha/unpacked
+          # 使用官方稳定下载地址
+          wget -O nopecha.zip https://github.com/NopeCHA/NopeCHA/releases/download/0.1.18/nopecha-0.1.18.zip
+          unzip nopecha.zip -d extensions/nopecha/unpacked
+          echo "📌 NopeCHA manifest check:"
+          ls -R extensions/nopecha/unpacked
 
-      - name: Unpack Buster extension
-        run: |
-          mkdir -p extensions/buster/unpacked
-          7z x -y extensions/buster/buster.zip -oextensions/buster/unpacked
-
-          echo "📌 manifest.json:"
-          cat extensions/buster/unpacked/manifest.json
-
+      # =========================
+      # 🚀 执行续费脚本
+      # =========================
       - name: Run renew script
+        working-directory: scripts
         env:
           HY2_URL: ${{ secrets.HY2_URL }}
           RENEW_URL: ${{ secrets.RENEW_URL }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          MAX_RETRY: "3"
+          # 增加一个变量让脚本知道它在 scripts 目录下
+          NODE_PATH: .
         run: |
           mkdir -p screenshots
-          xvfb-run -a node renew.js
+          # 使用 xvfb 模拟有头浏览器环境
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" node renew.js
 
-      - uses: actions/upload-artifact@v4
+      # =========================
+      # 📤 上传截图 (报错排查关键)
+      # =========================
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: screenshots
-          path: screenshots/*
+          path: scripts/screenshots/*.png
+          if-no-files-found: warn
