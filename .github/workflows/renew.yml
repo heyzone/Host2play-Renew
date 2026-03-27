@@ -59,26 +59,17 @@ jobs:
           # 安装 chromium 及其系统驱动依赖
           npx playwright install --with-deps chromium
 
-      # 🧩 下载并解压 NopeCHA (修复 404 问题)
       # =========================
-      - name: Download and Unpack NopeCHA
+      # 🧩 下载并解压 Buster 扩展
+      # =========================
+      - name: Download and Unpack Buster
         working-directory: scripts
         run: |
-          mkdir -p extensions/nopecha/unpacked
-          # 使用官方仓库的最新的 chromium 扩展包地址
-          wget -O nopecha.zip https://github.com/NopeCHALLC/nopecha-extension/releases/latest/download/chromium.zip
-          
-          # 使用 7z 或 unzip 解压
-          unzip -o nopecha.zip -d extensions/nopecha/unpacked
-          
-          echo "📌 NopeCHA manifest check:"
-          if [ -f "extensions/nopecha/unpacked/manifest.json" ]; then
-            cat extensions/nopecha/unpacked/manifest.json
-          else
-            echo "❌ 错误: manifest.json 未找到，请检查解压路径"
-            ls -R extensions/nopecha/unpacked
-            exit 1
-          fi
+          mkdir -p extensions/buster/unpacked
+          wget -O buster.zip https://github.com/dessant/buster/releases/download/v3.1.0/buster_captcha_solver_for_humans-3.1.0-chrome.zip
+          unzip -o buster.zip -d extensions/buster/unpacked
+          echo "📌 Buster manifest check:"
+          cat extensions/buster/unpacked/manifest.json
 
       # =========================
       # 🚀 执行续费脚本
