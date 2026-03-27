@@ -59,18 +59,26 @@ jobs:
           # 安装 chromium 及其系统驱动依赖
           npx playwright install --with-deps chromium
 
-      # =========================
-      # 🧩 下载并解压 NopeCHA (核心修改)
+      # 🧩 下载并解压 NopeCHA (修复 404 问题)
       # =========================
       - name: Download and Unpack NopeCHA
         working-directory: scripts
         run: |
           mkdir -p extensions/nopecha/unpacked
-          # 使用官方稳定下载地址
-          wget -O nopecha.zip https://github.com/NopeCHA/NopeCHA/releases/download/0.1.18/nopecha-0.1.18.zip
-          unzip nopecha.zip -d extensions/nopecha/unpacked
+          # 使用官方仓库的最新的 chromium 扩展包地址
+          wget -O nopecha.zip https://github.com/NopeCHALLC/nopecha-extension/releases/latest/download/chromium.zip
+          
+          # 使用 7z 或 unzip 解压
+          unzip -o nopecha.zip -d extensions/nopecha/unpacked
+          
           echo "📌 NopeCHA manifest check:"
-          ls -R extensions/nopecha/unpacked
+          if [ -f "extensions/nopecha/unpacked/manifest.json" ]; then
+            cat extensions/nopecha/unpacked/manifest.json
+          else
+            echo "❌ 错误: manifest.json 未找到，请检查解压路径"
+            ls -R extensions/nopecha/unpacked
+            exit 1
+          fi
 
       # =========================
       # 🚀 执行续费脚本
