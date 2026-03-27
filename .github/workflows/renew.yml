@@ -59,6 +59,11 @@ jobs:
           # 安装 chromium 及其系统驱动依赖
           npx playwright install --with-deps chromium
 
+      - name: Install Stealth Plugin
+        working-directory: scripts
+        run: |
+          npm install playwright-extra puppeteer-extra-plugin-stealth
+
       # =========================
       # 🧩 下载并解压 Buster 扩展
       # =========================
