@@ -9,7 +9,7 @@ const { chromium } = require("playwright");
 
 const RENEW_URL =
   process.env.RENEW_URL ||
-  "https://host2play.gratis/server/renew?i=65bd476a-deb6-4585-87fb-7adbe34809e8";
+  "https://host2play.gratis/server/renew?i=766827c0-a9a5-4e80-bc9a-4d50bfe9818e";
 
 const HY2_URL =
   process.env.HY2_URL ||
