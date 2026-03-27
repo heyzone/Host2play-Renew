@@ -17,41 +17,8 @@ const ensureDir = (dir) => !fs.existsSync(dir) && fs.mkdirSync(dir, { recursive:
 async function snap(page, name) {
     if (!page) return;
     ensureDir(SCREEN_DIR);
-    await page.screenshot({ path: path.join(SCREEN_DIR, `${Date.now()}_${name}.png`), fullPage: true });
-}
-
-/* --- 核心：强力清理广告 --- */
-async function cleanUI(page) {
-    await page.addStyleTag({
-        content: `div[class*="translate"], .fc-consent-root, iframe[src*="googleads"] { display: none !important; }`
-    }).catch(() => {});
-}
-
-/* --- 核心：暴力驱动 Buster --- */
-async function driveBuster(page) {
-    try {
-        console.log("🛠️ 正在进入验证码 Iframe...");
-        const bframe = page.frameLocator('iframe[src*="api2/bframe"]').first();
-        
-        // 1. 强制切换到音频挑战
-        console.log("🔊 切换音频模式...");
-        const audioBtn = bframe.locator('#recaptcha-audio-button');
-        await audioBtn.click({ force: true, timeout: 5000 }).catch(() => {});
-        await sleep(3000);
-
-        // 2. 强制点击 Buster 识别按钮 (那个彩色小人头)
-        console.log("🤖 触发 Buster 识别...");
-        const solverBtn = bframe.locator('.solver-button');
-        if (await solverBtn.count() > 0) {
-            await solverBtn.click({ force: true });
-            console.log("⏳ 等待音频破译 (可能需要30秒)...");
-            await sleep(30000); // 音频识别较慢，给足时间
-        } else {
-            console.log("⚠️ 未发现 Buster 按钮，可能插件加载失败");
-        }
-    } catch (e) {
-        console.log("⚠️ 驱动失败:", e.message);
-    }
+    const file = path.join(SCREEN_DIR, `${Date.now()}_${name}.png`);
+    await page.screenshot({ path: file, fullPage: true }).catch(() => {});
 }
 
 async function startHy2() {
@@ -65,7 +32,7 @@ async function startHy2() {
         socks5: { listen: `127.0.0.1:${SOCKS_PORT}` },
     }));
     const proc = spawn("hysteria", ["client", "-c", cfgPath]);
-    await sleep(5000); // 等待启动
+    await sleep(5000);
     return proc;
 }
 
@@ -79,38 +46,68 @@ async function renewOnce() {
         });
 
         page = await context.newPage();
-        await page.goto(RENEW_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await cleanUI(page);
+        page.setDefaultTimeout(60000);
 
-        const before = await page.locator("#deleteDate").textContent().catch(() => "未知");
+        console.log("🌍 访问页面...");
+        await page.goto(RENEW_URL, { waitUntil: "domcontentloaded" });
+        await sleep(8000); // 多等几秒让 JS 加载完
+
+        // ⭐ 修复：直接获取文本，增加容错
+        const before = await page.evaluate(() => document.querySelector("#deleteDate")?.innerText || "未知");
         console.log("📊 续期前:", before.trim());
 
-        await page.click('button:has-text("Renew server")', { force: true });
-        await page.waitForSelector('.swal2-popup', { state: 'attached' });
-        
-        // 触发复选框
+        console.log("🔘 正在尝试点击 Renew 按钮 (强制模式)...");
+        // ⭐ 核心修复：使用 evaluate 直接触发点击，无视“不可见”报错
+        await page.evaluate(() => {
+            const btn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.includes('Renew server'));
+            if (btn) btn.click();
+            else throw new Error("找不到 Renew 按钮");
+        });
+
+        console.log("⏳ 等待弹窗...");
+        await page.waitForSelector('.swal2-popup', { state: 'attached', timeout: 30000 });
+        await sleep(3000);
+
+        // 1. 触发 Recaptcha 复选框
+        console.log("☑️ 触发验证码复选框...");
         const anchorFrame = page.frameLocator('iframe[src*="api2/anchor"]').first();
         await anchorFrame.locator('#recaptcha-anchor').click({ force: true });
         await sleep(5000);
 
-        // 核心动作：手动推 Buster 一把
-        await driveBuster(page);
-        await snap(page, "after_buster_action");
+        // 2. 驱动 Buster 进入音频识别
+        console.log("🔊 正在切换音频并识别 (Buster)...");
+        const bframe = page.frameLocator('iframe[src*="api2/bframe"]').first();
+        await bframe.locator('#recaptcha-audio-button').click({ force: true }).catch(() => {});
+        await sleep(3000);
+        
+        const solverBtn = bframe.locator('.solver-button');
+        if (await solverBtn.count() > 0) {
+            await solverBtn.click({ force: true });
+            console.log("⏳ Buster 正在工作，请耐心等待 35s...");
+            await sleep(35000); 
+        }
 
-        // 提交
+        await snap(page, "after_buster");
+
+        // 3. 点击最后的确认
         console.log("🚀 提交确认...");
-        await page.locator(".swal2-confirm").click({ force: true }).catch(() => {});
+        await page.evaluate(() => {
+            const confirm = document.querySelector(".swal2-confirm");
+            if (confirm) confirm.click();
+        }).catch(() => {});
         
         await sleep(10000);
         await page.reload({ waitUntil: "domcontentloaded" });
-        const after = await page.locator("#deleteDate").textContent().catch(() => "获取失败");
+        await sleep(5000);
+        const after = await page.evaluate(() => document.querySelector("#deleteDate")?.innerText || "获取失败");
         console.log("📊 续期后:", after.trim());
 
-        if (after !== before) return { ok: true, after };
-        throw new Error("日期未更新");
+        if (after !== before && after !== "获取失败") return { ok: true, after };
+        throw new Error("日期未更新，可能识别失败或被拦截");
+
     } catch (e) {
-        console.error("💥 失败:", e.message);
-        await snap(page, "final_error");
+        console.error("💥 失败详情:", e.message);
+        if (page) await snap(page, "error_trace");
         return { ok: false, error: e.message };
     } finally {
         if (context) await context.close();
@@ -120,11 +117,13 @@ async function renewOnce() {
 
 (async () => {
     const res = await renewOnce();
-    if (process.env.TELEGRAM_BOT_TOKEN) {
-        const text = res.ok ? `✅ Host2Play 续期成功！\n新日期: ${res.after}` : `❌ 失败: ${res.error}`;
-        await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    if (token && chatId) {
+        const text = res.ok ? `✅ Host2Play 成功！\n新日期: ${res.after}` : `❌ 失败: ${res.error}`;
+        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML" })
+            body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" })
         }).catch(() => {});
     }
     process.exit(res.ok ? 0 : 1);
