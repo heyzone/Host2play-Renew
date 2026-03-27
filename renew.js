@@ -13,7 +13,7 @@ const RENEW_URL =
 
 const HY2_URL =
   process.env.HY2_URL ||
-  "hysteria2://0a6568ff-ea3c-4271-9020-450560e10d63@38.58.180.137:3003/?sni=www.bing.com&alpn=h3&insecure=1";
+  "hysteria2://a87056c0-abeb-45e4-a97e-f23bdf84d191@194.247.42.130:26482/?sni=www.bing.com&alpn=h3&insecure=1";
 
 const SOCKS_PORT = parseInt(process.env.SOCKS_PORT || "51080", 10);
 const MAX_RETRY = parseInt(process.env.MAX_RETRY || "2", 10);
