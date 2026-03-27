@@ -11,7 +11,8 @@ const HY2_URL = process.env.HY2_URL;
 const SOCKS_PORT = parseInt(process.env.SOCKS_PORT || "51080", 10);
 const MAX_RETRY = parseInt(process.env.MAX_RETRY || "3", 10);
 
-const EXT_BUSTER = path.resolve(__dirname, "extensions/buster/unpacked");
+// 路径必须与 yml 中的 mkdir 保持一致
+const EXT_NOPECHA = path.resolve(__dirname, "extensions/nopecha/unpacked");
 const SCREEN_DIR = path.resolve(__dirname, "screenshots");
 
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
@@ -22,15 +23,7 @@ function ensureScreenDir() {
   if (!fs.existsSync(SCREEN_DIR)) fs.mkdirSync(SCREEN_DIR, { recursive: true });
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function maskIP(ip) {
-  if (!ip) return "未知";
-  const parts = ip.split(".");
-  return parts.length === 4 ? `${parts[0]}.${parts[1]}.*.*` : ip;
-}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function snap(page, name) {
   try {
@@ -41,34 +34,8 @@ async function snap(page, name) {
   } catch {}
 }
 
-/* ========================= UI CLEANER ========================= */
-async function cleanUI(page) {
-  try {
-    await page.addStyleTag({
-      content: `
-        .fc-consent-root, .fc-dialog-overlay, iframe[src*="googleads"] { display: none !important; z-index: -1 !important; }
-        body { overflow: auto !important; }
-      `,
-    });
-  } catch {}
-}
-
-/* ========================= TELEGRAM ========================= */
-async function sendTelegram(text) {
-  try {
-    if (!TELEGRAM_CHAT_ID || !TELEGRAM_BOT_TOKEN) return;
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML" }),
-    });
-  } catch (e) { console.log("⚠️ TG Error:", e.message); }
-}
-
-/* ========================= PROXY & IP ========================= */
+/* ========================= HY2 PROXY ========================= */
 async function startHy2() {
-  if (!HY2_URL) throw new Error("❌ HY2_URL 未设置");
   const u = HY2_URL.replace("hysteria2://", "");
   const p = new URL("scheme://" + u);
   const cfgPath = path.join(os.tmpdir(), "hy2.json");
@@ -94,71 +61,86 @@ async function startHy2() {
   throw new Error("❌ 代理启动超时");
 }
 
-/* ========================= RENEW LOGIC ========================= */
+/* ========================= RENEW FLOW ========================= */
 async function renewOnce() {
   let hy2 = null, context = null;
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "pw-profile-"));
 
   try {
-    if (!fs.existsSync(path.join(EXT_BUSTER, "manifest.json"))) throw new Error("❌ Buster 插件路径错误");
+    // 检查扩展是否存在
+    if (!fs.existsSync(path.join(EXT_NOPECHA, "manifest.json"))) {
+      throw new Error(`❌ NopeCHA 扩展未找到，请检查 yml 下载路径: ${EXT_NOPECHA}`);
+    }
 
     hy2 = await startHy2();
+
     context = await chromium.launchPersistentContext(profile, {
       headless: false,
-      viewport: { width: 1280, height: 800 },
-      args: [`--proxy-server=socks5://127.0.0.1:${SOCKS_PORT}`, `--disable-extensions-except=${EXT_BUSTER}`, `--load-extension=${EXT_BUSTER}`, "--no-sandbox"]
+      args: [
+        `--proxy-server=socks5://127.0.0.1:${SOCKS_PORT}`,
+        `--disable-extensions-except=${EXT_NOPECHA}`,
+        `--load-extension=${EXT_NOPECHA}`,
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+      ],
     });
 
     const page = await context.newPage();
-    console.log("🔗 访问页面...");
-    await page.goto(RENEW_URL, { waitUntil: "networkidle", timeout: 60000 });
-    await cleanUI(page);
+    page.setDefaultTimeout(60000);
 
-    const getInfo = async () => {
-      const d = await page.locator("#deleteDate").textContent().catch(() => "");
-      return d.trim();
-    };
-    const beforeDate = await getInfo();
-    console.log(`📊 续期前删除时间: ${beforeDate}`);
+    console.log("🌍 访问 Host2Play...");
+    await page.goto(RENEW_URL, { waitUntil: "networkidle" });
+    
+    const before = (await page.locator("#deleteDate").textContent().catch(() => "")).trim();
+    console.log(`📊 续期前: ${before}`);
 
     console.log("🔘 点击 Renew 按钮");
     await page.click('button:has-text("Renew server")', { force: true });
 
-    // ⭐ 修复：等待弹窗，并处理可能被判定为 hidden 的 iframe
+    // 等待弹窗和验证码出现
     console.log("⏳ 等待验证码弹窗...");
-    await page.waitForSelector('.swal2-popup', { state: 'visible', timeout: 20000 });
-    await sleep(2000); // 确保动画完成
-
-    // ⭐ 修复：强制定位 recaptcha 框，不管它是否被判定为可见
+    await page.waitForSelector('.swal2-popup', { state: 'visible' });
+    
+    // NopeCHA 会自动识别并填充，我们只需要等待勾选出现
+    console.log("🧩 等待 NopeCHA 完成自动识别...");
     const anchorFrame = page.frameLocator('iframe[src*="api2/anchor"]').first();
     const checkbox = anchorFrame.locator('#recaptcha-anchor');
     
-    console.log("☑️ 尝试点击验证码复选框...");
-    await checkbox.click({ force: true, timeout: 15000 });
+    // 点击一次勾选框触发 NopeCHA
+    await checkbox.click({ force: true }).catch(() => {});
 
-    console.log("🧩 等待 Buster 插件处理 (15s)...");
-    await sleep(15000); 
-    await snap(page, "after_captcha_wait");
-
-    console.log("🚀 点击确认提交");
-    const confirmBtn = page.locator(".swal2-confirm");
-    if (await confirmBtn.isVisible()) {
-      await confirmBtn.click({ force: true });
+    // 关键：循环检测 Token 是否已生成（name="g-recaptcha-response" 的 textarea）
+    let solved = false;
+    for (let i = 0; i < 30; i++) { // 最多等 60 秒
+        const token = await page.evaluate(() => {
+            return document.querySelector('textarea[name="g-recaptcha-response"]')?.value;
+        });
+        if (token && token.length > 50) {
+            console.log("✅ 验证码已破译 (Token Ready)");
+            solved = true;
+            break;
+        }
+        await sleep(2000);
     }
+
+    if (!solved) throw new Error("❌ NopeCHA 破译超时");
+
+    await snap(page, "captcha_solved");
+
+    console.log("🚀 提交最终确认");
+    await page.click(".swal2-confirm", { force: true });
 
     await sleep(5000);
     await page.reload({ waitUntil: "networkidle" });
-    const afterDate = await getInfo();
-    console.log(`📊 续期后删除时间: ${afterDate}`);
+    const after = (await page.locator("#deleteDate").textContent().catch(() => "")).trim();
+    console.log(`📊 续期后: ${after}`);
 
-    if (afterDate && afterDate !== beforeDate) {
-      return { ok: true, before: beforeDate, after: afterDate };
-    }
-    throw new Error("数据未变化，续期可能未成功");
+    if (after !== before) return { ok: true, before, after };
+    throw new Error("数据未变化");
 
   } catch (e) {
-    console.error("💥 运行报错:", e.message);
-    await snap(page, "error_trace");
+    console.error("💥 报错:", e.message);
+    await snap(page, "error");
     return { ok: false, error: e.message };
   } finally {
     if (context) await context.close();
@@ -166,21 +148,27 @@ async function renewOnce() {
   }
 }
 
-/* ========================= RUN ========================= */
+/* ========================= ENTRY ========================= */
 (async () => {
-  let res = null;
+  let finalRes = null;
   for (let i = 1; i <= MAX_RETRY; i++) {
-    console.log(`\n--- 尝试进度: ${i}/${MAX_RETRY} ---`);
-    res = await renewOnce();
-    if (res.ok) break;
+    console.log(`\n--- 尝试 ${i}/${MAX_RETRY} ---`);
+    finalRes = await renewOnce();
+    if (finalRes.ok) break;
     await sleep(5000);
   }
 
-  if (res.ok) {
-    await sendTelegram(`✅ <b>Host2Play 续期成功</b>\n🗑 删除时间更新为: <code>${res.after}</code>`);
-    process.exit(0);
-  } else {
-    await sendTelegram(`❌ <b>Host2Play 续期失败</b>\n原因: <code>${res.error}</code>`);
-    process.exit(1);
+  const tgUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const msg = finalRes.ok 
+    ? `✅ <b>Host2Play 成功</b>\n旧: ${finalRes.before}\n新: ${finalRes.after}`
+    : `❌ <b>Host2Play 失败</b>\n原因: ${finalRes.error}`;
+
+  if (TELEGRAM_BOT_TOKEN) {
+    await fetch(tgUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg, parse_mode: "HTML" }),
+    });
   }
+  process.exit(finalRes.ok ? 0 : 1);
 })();
