@@ -11,7 +11,6 @@ const HY2_URL = process.env.HY2_URL;
 const SOCKS_PORT = parseInt(process.env.SOCKS_PORT || "51080", 10);
 const MAX_RETRY = parseInt(process.env.MAX_RETRY || "3", 10);
 
-// 路径必须与 yml 中的 mkdir 保持一致
 const EXT_NOPECHA = path.resolve(__dirname, "extensions/nopecha/unpacked");
 const SCREEN_DIR = path.resolve(__dirname, "screenshots");
 
@@ -26,16 +25,18 @@ function ensureScreenDir() {
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function snap(page, name) {
+  if (!page) return; // 🛡️ 防止 page 未定义时报错
   try {
     ensureScreenDir();
     const file = path.join(SCREEN_DIR, `${Date.now()}_${name}.png`);
     await page.screenshot({ path: file, fullPage: true });
     console.log("📸 Screenshot:", file);
-  } catch {}
+  } catch (e) { console.log("⚠️ Snap error:", e.message); }
 }
 
 /* ========================= HY2 PROXY ========================= */
 async function startHy2() {
+  if (!HY2_URL) throw new Error("❌ HY2_URL Secret 未设置");
   const u = HY2_URL.replace("hysteria2://", "");
   const p = new URL("scheme://" + u);
   const cfgPath = path.join(os.tmpdir(), "hy2.json");
@@ -48,9 +49,11 @@ async function startHy2() {
   }));
 
   const proc = spawn("hysteria", ["client", "-c", cfgPath]);
+  
+  // 增加代理可用性检测
   const start = Date.now();
   while (Date.now() - start < 20000) {
-    await sleep(1000);
+    await sleep(2000);
     const ok = await new Promise(r => {
       const s = net.createConnection(SOCKS_PORT, "127.0.0.1");
       s.on("connect", () => { s.destroy(); r(true); });
@@ -58,21 +61,22 @@ async function startHy2() {
     });
     if (ok) return proc;
   }
-  throw new Error("❌ 代理启动超时");
+  proc.kill();
+  throw new Error("❌ Hysteria2 代理无法连接");
 }
 
 /* ========================= RENEW FLOW ========================= */
 async function renewOnce() {
-  let hy2 = null, context = null;
+  let hy2 = null, context = null, page = null; // 🛡️ 预定义 page 为 null
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "pw-profile-"));
 
   try {
-    // 检查扩展是否存在
     if (!fs.existsSync(path.join(EXT_NOPECHA, "manifest.json"))) {
-      throw new Error(`❌ NopeCHA 扩展未找到，请检查 yml 下载路径: ${EXT_NOPECHA}`);
+      throw new Error(`❌ NopeCHA 扩展未找到: ${EXT_NOPECHA}`);
     }
 
     hy2 = await startHy2();
+    console.log("✅ 代理已启动，正在启动浏览器...");
 
     context = await chromium.launchPersistentContext(profile, {
       headless: false,
@@ -81,94 +85,84 @@ async function renewOnce() {
         `--disable-extensions-except=${EXT_NOPECHA}`,
         `--load-extension=${EXT_NOPECHA}`,
         "--no-sandbox",
-        "--disable-dev-shm-usage",
       ],
     });
 
-    const page = await context.newPage();
-    page.setDefaultTimeout(60000);
+    page = await context.newPage();
+    page.setDefaultTimeout(90000); // 增加到 90 秒
 
-    console.log("🌍 访问 Host2Play...");
-    await page.goto(RENEW_URL, { waitUntil: "networkidle" });
-    
-    const before = (await page.locator("#deleteDate").textContent().catch(() => "")).trim();
+    console.log("🌍 正在访问 Host2Play (domcontentloaded 模式)...");
+    // 🛡️ 使用 domcontentloaded 避免因为广告没加载完而超时
+    await page.goto(RENEW_URL, { waitUntil: "domcontentloaded" });
+    await sleep(5000); // 给页面一点时间缓冲
+
+    const before = (await page.locator("#deleteDate").textContent().catch(() => "未知")).trim();
     console.log(`📊 续期前: ${before}`);
 
     console.log("🔘 点击 Renew 按钮");
     await page.click('button:has-text("Renew server")', { force: true });
 
-    // 等待弹窗和验证码出现
-    console.log("⏳ 等待验证码弹窗...");
+    console.log("⏳ 等待弹窗并处理验证码...");
     await page.waitForSelector('.swal2-popup', { state: 'visible' });
     
-    // NopeCHA 会自动识别并填充，我们只需要等待勾选出现
-    console.log("🧩 等待 NopeCHA 完成自动识别...");
-    const anchorFrame = page.frameLocator('iframe[src*="api2/anchor"]').first();
-    const checkbox = anchorFrame.locator('#recaptcha-anchor');
-    
-    // 点击一次勾选框触发 NopeCHA
-    await checkbox.click({ force: true }).catch(() => {});
+    // NopeCHA 自动识别
+    await sleep(15000); 
+    await snap(page, "nopecha_processing");
 
-    // 关键：循环检测 Token 是否已生成（name="g-recaptcha-response" 的 textarea）
-    let solved = false;
-    for (let i = 0; i < 30; i++) { // 最多等 60 秒
-        const token = await page.evaluate(() => {
-            return document.querySelector('textarea[name="g-recaptcha-response"]')?.value;
-        });
-        if (token && token.length > 50) {
-            console.log("✅ 验证码已破译 (Token Ready)");
-            solved = true;
-            break;
-        }
-        await sleep(2000);
+    // 检测是否有验证码 token 生成
+    const isSolved = await page.evaluate(() => {
+        const t = document.querySelector('textarea[name="g-recaptcha-response"]');
+        return t && t.value.length > 50;
+    });
+
+    if (isSolved) {
+        console.log("✅ NopeCHA 似乎已完成识别，准备提交");
+    } else {
+        console.log("⚠️ 未检测到 Token，尝试点击一次确认看看...");
     }
 
-    if (!solved) throw new Error("❌ NopeCHA 破译超时");
-
-    await snap(page, "captcha_solved");
-
-    console.log("🚀 提交最终确认");
     await page.click(".swal2-confirm", { force: true });
+    await sleep(8000);
 
+    await page.reload({ waitUntil: "domcontentloaded" });
     await sleep(5000);
-    await page.reload({ waitUntil: "networkidle" });
-    const after = (await page.locator("#deleteDate").textContent().catch(() => "")).trim();
+    const after = (await page.locator("#deleteDate").textContent().catch(() => "获取失败")).trim();
     console.log(`📊 续期后: ${after}`);
 
-    if (after !== before) return { ok: true, before, after };
-    throw new Error("数据未变化");
+    if (after !== before && after !== "获取失败") return { ok: true, before, after };
+    throw new Error("续期后日期未更新，请检查截图");
 
   } catch (e) {
-    console.error("💥 报错:", e.message);
-    await snap(page, "error");
+    console.error("💥 错误详情:", e.message);
+    if (page) await snap(page, "error"); // 🛡️ 只有 page 存在时才截图
     return { ok: false, error: e.message };
   } finally {
-    if (context) await context.close();
+    if (context) await context.close().catch(() => {});
     if (hy2) hy2.kill();
   }
 }
 
 /* ========================= ENTRY ========================= */
 (async () => {
-  let finalRes = null;
+  let finalRes = { ok: false };
   for (let i = 1; i <= MAX_RETRY; i++) {
-    console.log(`\n--- 尝试 ${i}/${MAX_RETRY} ---`);
+    console.log(`\n--- 尝试第 ${i}/${MAX_RETRY} 次 ---`);
     finalRes = await renewOnce();
     if (finalRes.ok) break;
     await sleep(5000);
   }
 
-  const tgUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   const msg = finalRes.ok 
-    ? `✅ <b>Host2Play 成功</b>\n旧: ${finalRes.before}\n新: ${finalRes.after}`
-    : `❌ <b>Host2Play 失败</b>\n原因: ${finalRes.error}`;
+    ? `✅ <b>Host2Play 续期成功</b>\n旧日期: ${finalRes.before}\n新日期: ${finalRes.after}`
+    : `❌ <b>Host2Play 续期失败</b>\n原因: ${finalRes.error}`;
 
   if (TELEGRAM_BOT_TOKEN) {
+    const tgUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
     await fetch(tgUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg, parse_mode: "HTML" }),
-    });
+    }).catch(() => {});
   }
   process.exit(finalRes.ok ? 0 : 1);
 })();
