@@ -18,10 +18,11 @@ jobs:
       # =========================
       # 📥 检出
       # =========================
-      - name: Checkout public repo (Host2Play)
+      - name: Checkout private repo (Host2Play)
         uses: actions/checkout@v4
         with:
-          repository: heyzone/Host2play-Renew
+          repository: ${{ github.repository_owner }}/host2play-auto
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           path: scripts
 
       # =========================
