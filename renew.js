@@ -3,171 +3,618 @@ const os = require("os");
 const path = require("path");
 const net = require("net");
 const { spawn } = require("child_process");
-// ⭐ 核心变化：使用 extra 和 stealth 插件
-const { chromium } = require("playwright-extra");
-const stealth = require("puppeteer-extra-plugin-stealth")();
+const { chromium } = require("playwright");
 
-chromium.use(stealth);
+/* ========================= CONFIG ========================= */
 
-/* ========================= 配置区 ========================= */
-const RENEW_URL = process.env.RENEW_URL;
-const HY2_URL = process.env.HY2_URL;
+const RENEW_URL =
+  process.env.RENEW_URL ||
+  "https://host2play.gratis/server/renew?i=766827c0-a9a5-4e80-bc9a-4d50bfe9818e";
+
+const HY2_URL =
+  process.env.HY2_URL ||
+  "hysteria2://a87056c0-abeb-45e4-a97e-f23bdf84d191@194.247.42.130:26482/?sni=www.bing.com&alpn=h3&insecure=1";
+
 const SOCKS_PORT = parseInt(process.env.SOCKS_PORT || "51080", 10);
+const MAX_RETRY = parseInt(process.env.MAX_RETRY || "2", 10);
 
-const EXT_PATH = path.resolve(__dirname, "extensions/buster/unpacked");
+const EXT_NOPECHA = path.resolve(__dirname, "extensions/nopecha/unpacked");
 const SCREEN_DIR = path.resolve(__dirname, "screenshots");
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const ensureDir = (dir) => !fs.existsSync(dir) && fs.mkdirSync(dir, { recursive: true });
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+
+/* ========================= UTILS ========================= */
+
+function ensureScreenDir() {
+  if (!fs.existsSync(SCREEN_DIR)) fs.mkdirSync(SCREEN_DIR, { recursive: true });
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function maskIP(ip) {
+  const parts = ip.split(".");
+  if (parts.length === 4) return `${parts[0]}.${parts[1]}.*.*`;
+  return ip;
+}
 
 async function snap(page, name) {
-    if (!page) return;
-    ensureDir(SCREEN_DIR);
-    await page.screenshot({ path: path.join(SCREEN_DIR, `${Date.now()}_${name}.png`), fullPage: true }).catch(() => {});
+  try {
+    ensureScreenDir();
+    const file = path.join(SCREEN_DIR, `${Date.now()}_${name}.png`);
+    await page.screenshot({ path: file, fullPage: true });
+    console.log("📸 Screenshot:", file);
+  } catch {}
 }
 
-/* ========================= 代理逻辑 ========================= */
+async function dumpHTML(page, name) {
+  try {
+    ensureScreenDir();
+    const file = path.join(SCREEN_DIR, `${Date.now()}_${name}.html`);
+    fs.writeFileSync(file, await page.content(), "utf-8");
+    console.log("🧾 HTML Dump:", file);
+  } catch {}
+}
+
+/* ========================= 广告增强（安全版） ========================= */
+
+async function blockAds(context) {
+  await context.route("**/*", (route) => {
+    const url = route.request().url();
+
+    if (
+      url.includes("doubleclick") ||
+      url.includes("googlesyndication") ||
+      url.includes("adservice") ||
+      url.includes("adsystem") ||
+      url.includes("exoclick") ||
+      url.includes("popads")
+    ) {
+      return route.abort();
+    }
+
+    route.continue();
+  });
+}
+
+async function hideAdsByCSS(page) {
+  await page.addStyleTag({
+    content: `
+      iframe[src*="doubleclick"],
+      iframe[src*="googlesyndication"],
+      iframe[src*="exoclick"],
+      iframe[src*="popads"] {
+        display:none !important;
+      }
+    `,
+  });
+}
+
+async function removeOverlay(page) {
+  await page.evaluate(() => {
+    const elements = Array.from(document.querySelectorAll("*"));
+
+    elements.forEach(el => {
+      const style = window.getComputedStyle(el);
+
+      const isOverlay =
+        style.position === "fixed" &&
+        parseInt(style.zIndex || "0") > 1000 &&
+        el.offsetWidth > 200 &&
+        el.offsetHeight > 200;
+
+      if (isOverlay && !el.innerText.includes("Renew server")) {
+        el.remove();
+      }
+    });
+
+    document.body.style.overflow = "auto";
+  });
+}
+
+/* ========================= TELEGRAM ========================= */
+
+async function sendTelegram(text) {
+  try {
+    if (!TELEGRAM_CHAT_ID || !TELEGRAM_BOT_TOKEN) return;
+
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+    });
+
+    const data = await r.json();
+
+    if (!data.ok) {
+      console.log("⚠️ Telegram send failed:", data);
+    }
+  } catch (e) {
+    console.log("⚠️ Telegram error:", e?.message || e);
+  }
+}
+
+/* ========================= CONSENT ========================= */
+
+async function handleConsent(page) {
+  try {
+    const btn = page
+      .locator(
+        'button:has-text("Consent"), button:has-text("Accept"), button:has-text("Agree"), button:has-text("Allow")'
+      )
+      .first();
+
+    if (await btn.isVisible({ timeout: 5000 })) {
+      await btn.click({ force: true });
+      await page.waitForTimeout(1500);
+    }
+  } catch {}
+
+  try {
+    await page.evaluate(() => {
+      document
+        .querySelectorAll(
+          "#fc-consent-root, .fc-dialog-overlay, .fc-consent-root"
+        )
+        .forEach((e) => e.remove());
+    });
+  } catch {}
+}
+
+/* ========================= READ SERVER INFO ========================= */
+
+async function readServerInfo(page, tag) {
+  try {
+    const name = (await page.locator("#serverName").textContent())?.trim();
+    const expire = (await page.locator("#expireDate").textContent())?.trim();
+    const del = (await page.locator("#deleteDate").textContent())?.trim();
+
+    console.log(`📊 [${tag}] 服务器: ${name} `);
+    console.log(`📊 [${tag}] 剩余时间: ${expire}`);
+    console.log(`📊 [${tag}] 删除时间: ${del}`);
+
+    return { name, expire, del };
+  } catch {
+    console.log(`⚠️ [${tag}] 无法读取服务器信息`);
+    return null;
+  }
+}
+
+/* ========================= HY2 ========================= */
+
+function parseHy2(url) {
+  const u = url.replace("hysteria2://", "");
+  const parsed = new URL("scheme://" + u);
+
+  return {
+    server: `${parsed.hostname}:${parsed.port}`,
+    auth: decodeURIComponent(parsed.username),
+    sni: parsed.searchParams.get("sni") || parsed.hostname,
+    insecure: parsed.searchParams.get("insecure") === "1",
+    alpn: parsed.searchParams.get("alpn") || "h3",
+  };
+}
+
+async function waitPort(port) {
+  const start = Date.now();
+  while (Date.now() - start < 15000) {
+    await sleep(1000);
+
+    const ok = await new Promise((res) => {
+      const s = net.createConnection(port, "127.0.0.1");
+      s.on("connect", () => {
+        s.destroy();
+        res(true);
+      });
+      s.on("error", () => res(false));
+    });
+
+    if (ok) return true;
+  }
+  return false;
+}
+
 async function startHy2() {
-    const u = HY2_URL.replace("hysteria2://", "");
-    const p = new URL("scheme://" + u);
-    const cfgPath = path.join(os.tmpdir(), "hy2.json");
-    fs.writeFileSync(cfgPath, JSON.stringify({
-        server: `${p.hostname}:${p.port}`,
-        auth: decodeURIComponent(p.username),
-        tls: { sni: p.searchParams.get("sni") || p.hostname, insecure: p.searchParams.get("insecure") === "1" },
+  if (!HY2_URL) throw new Error("❌ HY2_URL 未设置");
+
+  const cfg = parseHy2(HY2_URL);
+  const cfgPath = "/tmp/hy2.json";
+
+  fs.writeFileSync(
+    cfgPath,
+    JSON.stringify(
+      {
+        server: cfg.server,
+        auth: cfg.auth,
+        tls: { sni: cfg.sni, insecure: cfg.insecure, alpn: [cfg.alpn] },
         socks5: { listen: `127.0.0.1:${SOCKS_PORT}` },
-    }));
-    const proc = spawn("hysteria", ["client", "-c", cfgPath]);
-    await sleep(6000); 
-    return proc;
+      },
+      null,
+      2
+    )
+  );
+
+  console.log("🚀 启动 hysteria2 client...");
+
+  const proc = spawn("hysteria", ["client", "-c", cfgPath], {
+    stdio: "ignore",
+    detached: true,
+  });
+
+  if (!(await waitPort(SOCKS_PORT))) {
+    throw new Error("❌ Hy2 socks5 未就绪");
+  }
+
+  console.log(`✅ Hy2 socks5 已就绪: 127.0.0.1:${SOCKS_PORT}`);
+  return proc;
 }
 
-/* ========================= 核心流程 ========================= */
+/* ========================= EXTENSION CHECK ========================= */
+
+async function waitExtensionLoaded(context) {
+  console.log("🧩 等待 加载...");
+
+  for (let i = 0; i < 40; i++) {
+    const sw = context.serviceWorkers();
+    const bg = context.backgroundPages();
+
+    if (sw.length > 0 || bg.length > 0) {
+      console.log(`✅ 加载已完成`);
+      return true;
+    }
+
+    await sleep(500);
+  }
+
+  return false;
+}
+
+/* ========================= PLAYWRIGHT EXIT IP CHECK ========================= */
+
+async function checkBrowserExitIP(context) {
+  console.log("🌍 [Browser] 检测 Playwright 出口 IP...");
+
+  const apis = [
+    {
+      url: "https://ip.eooce.com/",
+      parse: (data) => ({
+        ip: data.ip,
+        cc: data.country_code,
+        org: data.organization,
+      }),
+    },
+    {
+      url: "https://api.ip.sb/geoip",
+      parse: (data) => ({
+        ip: data.ip,
+        cc: data.country_code,
+        org: data.isp || data.org,
+      }),
+    },
+    {
+      url: "https://ipapi.co/json",
+      parse: (data) => ({
+        ip: data.ip,
+        cc: data.country_code,
+        org: data.org,
+      }),
+    },
+    {
+      url: "https://api.ipify.org?format=json",
+      parse: (data) => ({
+        ip: data.ip,
+        cc: "",
+        org: "",
+      }),
+    },
+  ];
+
+  let page = null;
+
+  try {
+    page = await context.newPage();
+    page.setDefaultTimeout(15000);
+
+    for (const api of apis) {
+      try {
+        const resp = await page.goto(api.url, {
+          waitUntil: "domcontentloaded",
+          timeout: 15000,
+        });
+
+        if (!resp) continue;
+
+        console.log(`🌍 [Browser]  status: ${resp.status()}`);
+
+        if (resp.status() >= 400) continue;
+
+        const bodyText = await page.evaluate(() => document.body.innerText);
+        let json;
+
+        try {
+          json = JSON.parse(bodyText);
+        } catch {
+          console.log("⚠️ [Browser] JSON parse failed:", bodyText.slice(0, 200));
+          continue;
+        }
+
+        const info = api.parse(json);
+
+        if (info && info.ip) {
+          const masked = maskIP(info.ip);
+          const label = [info.cc, info.org].filter(Boolean).join("-");
+
+          console.log(`🌍 Playwright 出口 IP: ${masked} (${label})`);
+          return `${masked}${label ? " (" + label + ")" : ""}`;
+        }
+      } catch (e) {
+        console.log(
+          `⚠️ [Browser] ${api.url} 查询失败:`,
+          e?.message || e
+        );
+        continue;
+      }
+    }
+
+    console.log("🌍 Playwright 出口 IP: 未知 IP");
+    return "未知 IP";
+  } finally {
+    try {
+      if (page) await page.close();
+    } catch {}
+  }
+}
+
+/* ========================= CAPTCHA ========================= */
+
+async function clickRecaptchaCheckbox(page) {
+  console.log("☑️ 等待 recaptcha anchor iframe...");
+
+  const iframeHandle = await page.waitForSelector(
+    'iframe[src*="recaptcha/api2/anchor"]',
+    { timeout: 300000 }
+  );
+
+  const frame = await iframeHandle.contentFrame();
+  if (!frame) throw new Error("❌ 无法获取 anchor iframe frame");
+
+  const checkbox = await frame.waitForSelector("#recaptcha-anchor", {
+    timeout: 60000,
+  });
+
+  console.log("🖱️ 点击 recaptcha checkbox");
+  await checkbox.click({ force: true });
+
+  await page.waitForTimeout(2000);
+}
+
+async function waitTokenAllFrames(page, timeoutMs = 300000) {
+  console.log("⏳ 等待   生成 token...");
+
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    for (const frame of page.frames()) {
+      try {
+        const token = await frame.evaluate(() => {
+          const t = document.querySelector(
+            "textarea[name='g-recaptcha-response']"
+          );
+          return t?.value || "";
+        });
+
+        if (token && token.length > 30) {
+          console.log("✅ Token 已生成:", token.slice(0, 12) + "...");
+          return token;
+        }
+      } catch {}
+    }
+
+    await page.waitForTimeout(2000);
+  }
+
+  throw new Error("❌ Token 等待超时");
+}
+/* ========================= MAIN FLOW ========================= */
+
 async function renewOnce() {
-    let hy2, context, page;
-    const profile = fs.mkdtempSync(path.join(os.tmpdir(), "pw-stealth-"));
+  ensureScreenDir();
+
+  let hy2 = null;
+  let page = null;
+  let context = null;
+
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "pw-profile-"));
+
+  try {
+    if (!fs.existsSync(path.join(EXT_NOPECHA, "manifest.json"))) {
+      throw new Error("❌ NopeCHA manifest.json 不存在");
+    }
+
+    hy2 = await startHy2();
+    await sleep(2000);
+
+    context = await chromium.launchPersistentContext(profile, {
+      headless: false,
+      slowMo: 40,
+      viewport: { width: 1280, height: 720 },
+      args: [
+        `--proxy-server=socks5://127.0.0.1:${SOCKS_PORT}`,
+        `--disable-extensions-except=${EXT_NOPECHA}`,
+        `--load-extension=${EXT_NOPECHA}`,
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+      ],
+    });
+
+    context.setDefaultTimeout(180000);
+
+    await blockAds(context);
+
+    const okExt = await waitExtensionLoaded(context);
+    if (!okExt) throw new Error("❌ 扩展未加载成功");
+
+    const exitIP = await checkBrowserExitIP(context);
+
+    page = await context.newPage();
+
+    console.log("🌍 打开 renew 页面");
+    await page.goto(RENEW_URL, {
+      waitUntil: "networkidle",
+      timeout: 180000,
+    });
+
+    await page.waitForTimeout(2000);
+
+    await hideAdsByCSS(page);
+    await removeOverlay(page);
+    await handleConsent(page);
+
+    const before = await readServerInfo(page, "续期前");
+
+    console.log("🟢 点击 Renew server");
+
+    const renewBtn = page.getByRole("button", { name: /^Renew server$/i });
+    await renewBtn.waitFor({ timeout: 60000 });
+    await renewBtn.click({ force: true });
+
+    console.log("⏳ 等待 swal2 弹窗...");
+    await page.waitForSelector(".swal2-popup", { timeout: 300000 });
+
+    await page.waitForTimeout(1200);
+
+    console.log("🧩 点击 recaptcha checkbox");
+    await clickRecaptchaCheckbox(page);
+
+    await waitTokenAllFrames(page, 300000);
+
+    await snap(page, "captcha_passed");
+
+    console.log("🟢 点击最终确认按钮");
+
+    const confirmBtn = page.locator(".swal2-confirm");
+    await confirmBtn.waitFor({ timeout: 60000 });
+    await confirmBtn.click({ force: true });
+
+    // ✅ 等 swal2 关闭
+    await page.waitForSelector(".swal2-popup", {
+      state: "hidden",
+      timeout: 180000,
+    });
+
+    // ✅ 如果有 loading，等它结束
+    const spinner = page.locator(".loading-spinner");
+    if (await spinner.count()) {
+      await spinner
+        .waitFor({ state: "hidden", timeout: 180000 })
+        .catch(() => {});
+    }
+
+    // ✅ 强制刷新页面（关键步骤）
+    console.log("🔄 强制刷新页面获取最新数据...");
+    await page.reload({
+      waitUntil: "networkidle",
+      timeout: 180000,
+    });
+
+    await page.waitForTimeout(2000);
+
+    await hideAdsByCSS(page);
+    await removeOverlay(page);
+    await handleConsent(page);
+
+    await page.locator("#expireDate").waitFor({ timeout: 60000 });
+
+    await snap(page, "renew_done");
+
+    const after = await readServerInfo(page, "续期后");
+
+    // ✅ 成功校验：删除时间或剩余时间应变化
+    if (
+      !after ||
+      (before?.expire === after?.expire &&
+        before?.del === after?.del)
+    ) {
+      throw new Error("❌ 续期后数据未变化，可能未成功");
+    }
+
+    console.log("🎉 续期流程完成");
+
+    return { ok: true, before, after, exitIP };
+
+  } catch (e) {
+    const msg = e?.message || String(e);
+    console.error("💥 renewOnce error:", msg);
+
+    if (page) {
+      await snap(page, "error");
+      await dumpHTML(page, "error");
+    }
+
+    return { ok: false, error: msg };
+  } finally {
+    try {
+      if (context) await context.close();
+    } catch {}
 
     try {
-        hy2 = await startHy2();
-        
-        console.log("🕵️ 正在启动 Stealth 混淆浏览器...");
-        context = await chromium.launchPersistentContext(profile, {
-            headless: false,
-            // 抹除各种自动化痕迹
-            ignoreDefaultArgs: ["--enable-automation"],
-            args: [
-                `--proxy-server=socks5://127.0.0.1:${SOCKS_PORT}`,
-                `--disable-extensions-except=${EXT_PATH}`,
-                `--load-extension=${EXT_PATH}`,
-                "--no-sandbox",
-                "--disable-infobars",
-                "--window-size=1280,720"
-            ]
-        });
-
-        page = await context.newPage();
-        // 抹除 webdriver 特征
-        await page.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        });
-
-        console.log("🌍 访问 Host2Play...");
-        await page.goto(RENEW_URL, { waitUntil: "networkidle", timeout: 60000 });
-
-        // 随机滚动
-        console.log("⏳ 模拟真人随机滚动和停留...");
-        await page.mouse.move(Math.random()*500, Math.random()*500);
-        await sleep(15000);
-        await page.evaluate(() => window.scrollBy(0, Math.random()*300 + 200));
-        await sleep(10000);
-
-        const before = await page.evaluate(() => document.querySelector("#deleteDate")?.innerText || "未知");
-        console.log("📊 续期前:", before.trim());
-
-        console.log("🔘 暴力点击 Renew...");
-        await page.evaluate(() => {
-            const btn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.includes('Renew server'));
-            if (btn) btn.click();
-        });
-
-        await page.waitForSelector('.swal2-popup', { state: 'attached' });
-        await sleep(5000);
-
-        // --- 验证码核心突破 ---
-        const anchorFrame = page.frameLocator('iframe[src*="api2/anchor"]').first();
-        await anchorFrame.locator('#recaptcha-anchor').click({ force: true });
-        console.log("☑️ 复选框已点，等待 10s 观察弹窗...");
-        await sleep(10000);
-
-        const bframe = page.frameLocator('iframe[src*="api2/bframe"]').first();
-        
-        // 尝试刷出 Buster
-        let solverBtn = bframe.locator('.solver-button');
-        if (await solverBtn.count() === 0) {
-            console.log("🔄 未发现图标，尝试切换音频模式强制唤醒...");
-            await bframe.locator('#recaptcha-audio-button').click({ force: true }).catch(() => {});
-            await sleep(5000);
-        }
-
-        if (await solverBtn.count() > 0) {
-            console.log("🚀 Buster 发现！开始破译...");
-            await solverBtn.click({ force: true });
-            // 给足识别时间
-            for (let i = 0; i < 10; i++) {
-                console.log(`⏳ 等待破译中 (${i*5}s)...`);
-                await sleep(5000);
-                // 检查是否打钩
-                const isChecked = await anchorFrame.locator('.recaptcha-checkbox-checked').count() > 0;
-                if (isChecked) {
-                    console.log("✅ 验证码已打钩！");
-                    break;
-                }
-            }
-        } else {
-            console.log("❌ 依旧无法唤醒 Buster，尝试最后一次强点确认（靠运气）");
-        }
-
-        await snap(page, "final_status");
-
-        console.log("🚀 点击确认提交...");
-        await page.evaluate(() => {
-            const confirm = document.querySelector(".swal2-confirm");
-            if (confirm) confirm.click();
-        }).catch(() => {});
-        
-        await sleep(15000);
-        await page.reload({ waitUntil: "domcontentloaded" });
-        const after = await page.evaluate(() => document.querySelector("#deleteDate")?.innerText || "获取失败");
-        console.log("📊 续期后:", after.trim());
-
-        if (after !== before && after !== "获取失败") return { ok: true, after };
-        throw new Error("日期未更新");
-
-    } catch (e) {
-        console.error("💥 失败:", e.message);
-        if (page) await snap(page, "stealth_error");
-        return { ok: false, error: e.message };
-    } finally {
-        if (context) await context.close().catch(() => {});
-        if (hy2) hy2.kill();
-    }
+      if (hy2) hy2.kill("SIGTERM");
+    } catch {}
+  }
 }
 
+/* ========================= ENTRY ========================= */
+
 (async () => {
-    let res = { ok: false };
-    for (let i = 1; i <= 2; i++) {
-        console.log(`\n--- 尝试第 ${i}/2 次 ---`);
-        res = await renewOnce();
-        if (res.ok) break;
-        await sleep(10000);
+  let lastError = "";
+  let successResult = null;
+
+  for (let i = 1; i <= MAX_RETRY; i++) {
+    console.log(`\n🔄 尝试 ${i}/${MAX_RETRY}\n`);
+    const result = await renewOnce();
+
+    if (result.ok) {
+      successResult = result;
+      break;
     }
 
-    if (process.env.TELEGRAM_BOT_TOKEN) {
-        const text = res.ok ? `✅ Host2Play 续期成功\n新日期: ${res.after}` : `❌ 失败: ${res.error}`;
-        await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML" })
-        }).catch(() => {});
+    lastError = result.error || "未知错误";
+    console.log("⚠️ 本次失败，准备重试...");
+    await sleep(4000);
+  }
+
+  if (successResult) {
+    const { before, after, exitIP } = successResult;
+
+    if (before && after) {
+      const msg =
+        `✅ <b>Host2Play Renew Success</b>\n\n` +
+        `🌍 <b>Exit IP</b>: ${exitIP}\n\n` +
+        `🖥 <b>Server</b>: ${after.name}\n\n` +
+        `⏳ <b>Before</b>: ${before.expire}\n` +
+        `🗑 <b>Delete</b>: ${before.del}\n\n` +
+        `⏳ <b>After</b>: ${after.expire}\n` +
+        `🗑 <b>Delete</b>: ${after.del}`;
+
+      await sendTelegram(msg);
     }
-    process.exit(res.ok ? 0 : 1);
+
+    process.exit(0);
+  }
+
+  await sendTelegram(
+    `❌ <b>Host2Play Renew Failed</b>\n\n<code>${lastError}</code>`
+  );
+
+  console.log("❌ 多次尝试仍失败，退出");
+  process.exit(1);
 })();
