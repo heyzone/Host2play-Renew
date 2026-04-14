@@ -1,19 +1,15 @@
 name: Host2Play Auto Renew
-
 on:
   workflow_dispatch:
   schedule:
-    # 每天 0:00 / 8:00 / 16:00 UTC，间隔约 8 小时，接近 7.5 小时
+    # 每天 0:30 / 8:30 UTC
     - cron: "30 0,8 * * *"
-
 permissions:
   contents: read
-
 jobs:
   renew:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
-
     steps:
       # =========================
       # 📥 检出
@@ -24,7 +20,6 @@ jobs:
           repository: ${{ github.repository_owner }}/host2play-auto
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           path: scripts
-
       # =========================
       # ⚡️ Node.js
       # =========================
@@ -32,7 +27,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
       # =========================
       # 📦 系统依赖
       # =========================
@@ -41,7 +35,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb wget unzip curl jq p7zip-full
-
       # =========================
       # 📡 安装 Hysteria2
       # =========================
@@ -53,7 +46,6 @@ jobs:
           chmod +x hysteria
           sudo mv hysteria /usr/local/bin/
           hysteria version
-
       # =========================
       # 📦 Node 依赖 + Playwright Chromium
       # =========================
@@ -63,17 +55,15 @@ jobs:
           npm init -y
           npm install playwright
           npx playwright install --with-deps chromium
-
       # =========================
-      # 📦 下载 扩展
+      # 📦 下载 NopeCHA 扩展
       # =========================
-      - name: Download  extension (chromium.zip)
+      - name: Download NopeCHA extension (chromium.zip)
         working-directory: scripts
         run: |
           mkdir -p extensions/nopecha
           wget -O extensions/nopecha/chromium.zip \
             https://github.com/NopeCHALLC/nopecha-extension/releases/latest/download/chromium.zip
-
       - name: Unpack NopeCHA extension
         working-directory: scripts
         run: |
@@ -81,13 +71,15 @@ jobs:
           7z x -y extensions/nopecha/chromium.zip -oextensions/nopecha/unpacked
           echo "📌 manifest.json:"
           cat extensions/nopecha/unpacked/manifest.json
-
       # =========================
       # 🚀 执行续费脚本
       # =========================
       - name: Run renew script
         working-directory: scripts
         env:
+          # 多节点：每行一个 hysteria2:// 链接
+          # 兼容旧的单节点 HY2_URL（只有一个节点时可以继续用）
+          HY2_URLS: ${{ secrets.HY2_URLS }}
           HY2_URL: ${{ secrets.HY2_URL }}
           RENEW_URL: ${{ secrets.RENEW_URL }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -95,9 +87,8 @@ jobs:
         run: |
           mkdir -p screenshots
           xvfb-run -a node renew.js
-
       # =========================
-      # 📤 上传截图（路径修正）
+      # 📤 上传截图
       # =========================
       - name: Upload screenshots
         uses: actions/upload-artifact@v4
